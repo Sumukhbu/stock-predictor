@@ -20,7 +20,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from yfinance import YFRateLimitError
 
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -38,12 +37,8 @@ from plotly.subplots import make_subplots
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-warnings_msg = False
-try:
-    import warnings
-    warnings.filterwarnings("ignore")
-except Exception:
-    warnings_msg = True
+import warnings
+warnings.filterwarnings("ignore")
 
 SEED = 42
 np.random.seed(SEED)
@@ -114,12 +109,25 @@ def fetch_stock_data_with_features(ticker: str, period: str = "2y") -> pd.DataFr
 
             return df
 
-        except YFRateLimitError as e:
-            logger.warning(f"yfinance rate limit for {ticker} (attempt {attempt}/{max_retries}): {e}")
-            time.sleep(backoff)
-            backoff *= 2
         except Exception as e:
-            logger.exception(f"yfinance fetch failed for {ticker} (attempt {attempt}/{max_retries}): {e}")
+            # Detect rate-limit or similar yfinance errors by message / class name
+            err_text = str(e).lower()
+            err_class = e.__class__.__name__.lower()
+            rate_limit_detected = (
+                ("rate" in err_text and "limit" in err_text)
+                or "too many requests" in err_text
+                or "429" in err_text
+                or "yfratelimit" in err_class
+                or "yfratelimiter" in err_class
+                or "yfratelimiterror" in err_class
+            )
+
+            if rate_limit_detected:
+                logger.warning(f"yfinance rate limit or throttling detected for {ticker} (attempt {attempt}/{max_retries}): {e}")
+            else:
+                logger.exception(f"yfinance fetch failed for {ticker} (attempt {attempt}/{max_retries}): {e}")
+
+            # backoff and retry
             time.sleep(backoff)
             backoff *= 2
 
