@@ -10,36 +10,24 @@ Professional Stock Predictor — Delta-based + Multi-feature + Residual-Informed
 - Default horizon set to 5 for illustrative multi-day chart
 """
 
-import os
-import time
-import logging
-import math
-from typing import Tuple, List
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
-
+from typing import Tuple, List
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-
-# Basic logging
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
-
+import math
 import warnings
-warnings.filterwarnings("ignore")
 
+warnings.filterwarnings("ignore")
 SEED = 42
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
@@ -73,91 +61,27 @@ def compute_macd(series: pd.Series, fast: int = 12, slow: int = 26, sig: int = 9
     hist = macd - signal
     return macd.fillna(0.0)
 
-# ---------------- Robust fetch with fallback ----------------
-@st.cache_data(ttl=3600)  # cache for 1 hour
+# ---------------- Data fetch & feature creation ----------------
+@st.cache_data(ttl=300)
 def fetch_stock_data_with_features(ticker: str, period: str = "2y") -> pd.DataFrame:
-    """
-    Try yfinance with retries/backoff; fallback to local CSV at data/<TICKER>_<PERIOD>.csv.
-    Returns DataFrame with Date/Open/High/Low/Close/Volume/RSI_14/MACD.
-    """
-    ticker = str(ticker).upper().strip()
-    local_cache_path = os.path.join("data", f"{ticker}_{period}.csv")
+    stock = yf.Ticker(ticker)
+    df = stock.history(period=period)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.reset_index()
+    df['Date'] = pd.to_datetime(df['Date'])
+    # Technical features
+    df['RSI_14'] = compute_rsi(df['Close'], window=14)
+    df['MACD'] = compute_macd(df['Close'], fast=12, slow=26, sig=9)
+    # Keep relevant columns and forward-fill any tiny gaps
+    df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'RSI_14', 'MACD']].ffill().dropna().reset_index(drop=True)
+    return df
 
-    max_retries = 4
-    backoff = 1.0
-    for attempt in range(1, max_retries + 1):
-        try:
-            stock = yf.Ticker(ticker)
-            df = stock.history(period=period)
-            if df is None or df.empty:
-                raise Exception("No data returned from yfinance or empty DataFrame")
-            df = df.reset_index()
-            df['Date'] = pd.to_datetime(df['Date'])
-
-            # compute indicators
-            df['RSI_14'] = compute_rsi(df['Close'], window=14)
-            df['MACD'] = compute_macd(df['Close'], fast=12, slow=26, sig=9)
-
-            df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'RSI_14', 'MACD']].ffill().dropna().reset_index(drop=True)
-
-            # Save local cache best-effort
-            try:
-                os.makedirs("data", exist_ok=True)
-                df.to_csv(local_cache_path, index=False)
-            except Exception as e:
-                logger.warning(f"Failed to write local cache {local_cache_path}: {e}")
-
-            return df
-
-        except Exception as e:
-            # Detect rate-limit or similar yfinance errors by message / class name
-            err_text = str(e).lower()
-            err_class = e.__class__.__name__.lower()
-            rate_limit_detected = (
-                ("rate" in err_text and "limit" in err_text)
-                or "too many requests" in err_text
-                or "429" in err_text
-                or "yfratelimit" in err_class
-                or "yfratelimiter" in err_class
-                or "yfratelimiterror" in err_class
-            )
-
-            if rate_limit_detected:
-                logger.warning(f"yfinance rate limit or throttling detected for {ticker} (attempt {attempt}/{max_retries}): {e}")
-            else:
-                logger.exception(f"yfinance fetch failed for {ticker} (attempt {attempt}/{max_retries}): {e}")
-
-            # backoff and retry
-            time.sleep(backoff)
-            backoff *= 2
-
-    # Fallback to local CSV if available
-    if os.path.exists(local_cache_path):
-        try:
-            df = pd.read_csv(local_cache_path, parse_dates=["Date"])
-            st.warning(f"Using local cached data for {ticker} (file: {local_cache_path}) due to remote fetch failure.")
-            if 'RSI_14' not in df.columns:
-                df['RSI_14'] = compute_rsi(df['Close'], window=14)
-            if 'MACD' not in df.columns:
-                df['MACD'] = compute_macd(df['Close'], fast=12, slow=26, sig=9)
-            df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'RSI_14', 'MACD']].ffill().dropna().reset_index(drop=True)
-            return df
-        except Exception as e:
-            logger.exception(f"Failed to read local cache {local_cache_path}: {e}")
-            st.error("Failed to fetch data remotely and failed to load local cache.")
-            return pd.DataFrame()
-
-    st.error(
-        f"Could not fetch {ticker} data from remote (rate-limited or unavailable). "
-        "Provide a cached CSV in the `data/` folder (e.g. data/AAPL_2y.csv) or try again later."
-    )
-    return pd.DataFrame()
-
-# ---------------- Windowing / features ----------------
 def create_window_features_multi(df: pd.DataFrame, lookback: int = 30, feature_cols: List[str] = None) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Build windows X of shape (n_samples, lookback, n_features),
+    Build windows X of shape (n_samples, lookback, n_features) using feature_cols,
     and targets y as delta of Close: next_close - last_close_in_window.
+    Feature column order is important (we expect Close to be at index 0 in the returned windows).
     """
     if feature_cols is None:
         feature_cols = ['Close', 'Open', 'High', 'Low', 'Volume', 'RSI_14', 'MACD']
@@ -190,19 +114,23 @@ def build_model_generic(model_type='lstm', input_shape=(30,7), units1=96, units2
     model.add(Dense(64, activation='relu'))
     model.add(Dense(32, activation='relu'))
     model.add(Dense(16, activation='relu'))
-    model.add(Dense(1))  # predict delta
+    model.add(Dense(1))  # predict delta of Close
     model.compile(optimizer=Adam(learning_rate=lr), loss='huber', metrics=['mae'])
     return model
 
-# ---------------- Predictor class ----------------
+# ---------------- Predictor class (multi-feature aware) ----------------
 class StockPredictor:
+    """
+    Scales X and y. Predicts deltas (next_close - last_close_in_window).
+    Expects the first feature in the feature vector to be 'Close' so we can reconstruct prices.
+    """
     def __init__(self, model_type='lstm', lookback=30, n_features=7, units1=96, units2=48, dropout_rate=0.12, lr=5e-4):
         self.model_type = model_type
         self.lookback = lookback
         self.n_features = n_features
         self.model = None
-        self.scaler = None
-        self.y_scaler = None
+        self.scaler = None       # scales flattened X features
+        self.y_scaler = None     # scales deltas
         self.is_trained = False
         self.units1 = units1
         self.units2 = units2
@@ -214,11 +142,13 @@ class StockPredictor:
 
     def train(self, X: np.ndarray, y: np.ndarray, validation_split=0.15, epochs=120, verbose=0):
         n_samples, seq_len, n_features = X.shape
+        # Flatten and scale X
         self.scaler = MinMaxScaler()
         X_flat = X.reshape(-1, n_features)
         X_scaled_flat = self.scaler.fit_transform(X_flat)
         X_scaled = X_scaled_flat.reshape(n_samples, seq_len, n_features)
 
+        # Scale y (deltas)
         self.y_scaler = MinMaxScaler()
         y_2d = y.reshape(-1, 1)
         y_scaled = self.y_scaler.fit_transform(y_2d).reshape(-1)
@@ -240,6 +170,11 @@ class StockPredictor:
         return X_scaled_flat.reshape(n_samples, seq_len, n_features)
 
     def predict_delta(self, X: np.ndarray, mc_dropout=False, n_iter=20) -> np.ndarray:
+        """
+        Return predicted delta(s).
+         - mc_dropout=False -> shape (n_samples,)
+         - mc_dropout=True -> shape (n_iter, n_samples)
+        """
         Xs = self._scale_X(X)
         if mc_dropout:
             preds = []
@@ -254,8 +189,14 @@ class StockPredictor:
             return p_real
 
     def predict_price_from_window(self, X_window: np.ndarray, mc_dropout=False, n_iter=20) -> np.ndarray:
+        """
+        Reconstruct predicted Close price(s) = last_window_close + predicted_delta.
+         - If mc_dropout True -> returns (n_iter, n_samples)
+         - Else returns (n_samples,)
+        Assumes Close is feature index 0.
+        """
         deltas = self.predict_delta(X_window, mc_dropout=mc_dropout, n_iter=n_iter)
-        last_closes = X_window[:, -1, 0]
+        last_closes = X_window[:, -1, 0]  # first column is Close per create_window_features_multi
         if mc_dropout:
             return deltas + last_closes[None, :]
         else:
@@ -303,11 +244,11 @@ def main():
         st.header("⚙️ Settings")
         ticker = st.selectbox("Choose Stock", ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"], index=0)
         model_type = st.radio("Model", ["LSTM", "GRU"])
-        lookback = st.slider("Lookback Days", 10, 60, 30)
-        horizon = st.slider("Prediction Horizon (days)", 1, 10, 5)
+        lookback = st.slider("Lookback Days", 10, 60, 30)  # increased default lookback
+        horizon = st.slider("Prediction Horizon (days)", 1, 10, 5)  # default 5
         period = st.selectbox("History Period", ["1y", "2y", "3y", "5y"], index=1)
         with st.expander("Advanced Settings"):
-            epochs = st.slider("Epochs", 20, 300, 120, step=10)
+            epochs = st.slider("Epochs", 20, 300, 120, step=10)  # longer default
             mc_iters = st.slider("MC Dropout Iterations (CI)", 10, 200, 50, step=5)
             show_naive = st.checkbox("Show Naive Baseline (Tomorrow = Today)", value=True)
         analyze = st.button("🚀 Analyze", use_container_width=True)
@@ -316,31 +257,11 @@ def main():
         st.info("Adjust settings on the left and click Analyze.")
         return
 
-    # Load local cache by default; fetch only when user requests
-    local_cache_path = os.path.join("data", f"{ticker}_{period}.csv")
-    df = pd.DataFrame()
-
-    if os.path.exists(local_cache_path):
-        try:
-            df = pd.read_csv(local_cache_path, parse_dates=["Date"])
-            if 'RSI_14' not in df.columns:
-                df['RSI_14'] = compute_rsi(df['Close'], window=14)
-            if 'MACD' not in df.columns:
-                df['MACD'] = compute_macd(df['Close'], fast=12, slow=26, sig=9)
-            df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'RSI_14', 'MACD']].ffill().dropna().reset_index(drop=True)
-            st.info(f"Loaded local cached data for {ticker} ({len(df)} rows). Click 'Fetch latest data' to refresh from Yahoo.")
-        except Exception as e:
-            logger.exception(f"Failed to load local cache {local_cache_path}: {e}")
-            df = pd.DataFrame()
-
-    if st.button("Fetch latest data from Yahoo/remote"):
-        with st.spinner("Fetching data and computing features from remote..."):
-            df_remote = fetch_stock_data_with_features(ticker, period)
-        if not df_remote.empty:
-            df = df_remote
-
+    # Fetch data + features
+    with st.spinner("Fetching data and computing features..."):
+        df = fetch_stock_data_with_features(ticker, period)
     if df.empty:
-        st.error("No data retrieved. Try another ticker, period, or create a local CSV in data/ by running the prefetch script.")
+        st.error("No data retrieved. Try another ticker or period.")
         return
 
     feature_cols = ['Close', 'Open', 'High', 'Low', 'Volume', 'RSI_14', 'MACD']
@@ -349,7 +270,7 @@ def main():
         st.error("Insufficient data for training. Increase period or reduce lookback.")
         return
 
-    # Train/test split
+    # Split
     split = int(len(X) * 0.8)
     X_train, y_train = X[:split], y[:split]
     X_test, y_test = X[split:], y[split:]
@@ -360,9 +281,10 @@ def main():
     with st.spinner("Training model (this can take a little while)..."):
         history = predictor.train(X_train, y_train, validation_split=0.15, epochs=epochs, verbose=0)
 
-    # Test predictions (deterministic)
+    # Test predictions
     preds_test_prices = predictor.predict_price_from_window(X_test, mc_dropout=False)
 
+    # Align test dates & true prices
     pred_start_idx = lookback + split
     dates_test = df['Date'].iloc[pred_start_idx: pred_start_idx + len(y_test)].reset_index(drop=True)
     true_prices = df['Close'].iloc[pred_start_idx: pred_start_idx + len(y_test)].values
@@ -429,6 +351,7 @@ def main():
         future_preds.append(pred_price)
         cur = cur_window.reshape(cur_window.shape[1], cur_window.shape[2]).copy()
         cur = np.roll(cur, -1, axis=0)
+        # replace only Close column (index 0) with predicted close
         cur[-1, 0] = pred_price
         cur_window = cur.reshape(1, cur.shape[0], cur.shape[1])
     future_preds = np.array(future_preds)
