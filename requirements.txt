@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+yfinance
+pandas
+numpy
+scikit-learn
+torch
+joblib
+matplotlib
+streamlit
+pandas
+numpy
+yfinance
+matplotlib
+scikit-learn
+tensorflow==2.20.0

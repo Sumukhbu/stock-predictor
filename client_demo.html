@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Realtime Prediction Demo</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>body{font-family:Arial;margin:20px} #chart{max-width:900px}</style>
+</head>
+<body>
+  <h2>Realtime Stock Prediction Demo (GOOGL)</h2>
+  <p>Connects to <code>/ws</code> endpoint on this server and plots predicted vs actual (predictions appear once buffer is full).</p>
+  <canvas id="chart" width="900" height="300"></canvas>
+  <pre id="log"></pre>
+  <script>
+    const ws = new WebSocket('ws://' + window.location.hostname + ':8000/ws');
+    const ctx = document.getElementById('chart').getContext('2d');
+    const log = document.getElementById('log');
+    const labels = [];
+    const actualData = [];
+    const predData = [];
+    const chart = new Chart(ctx, {
+      type: 'line',
+      data: { labels, datasets: [
+        { label: 'Predicted', data: predData, borderColor: 'red', fill: false },
+        { label: 'Actual (AdjClose)', data: actualData, borderColor: 'blue', fill: false }
+      ]},
+      options: { animation: false, scales: { x: { display: true }, y: { display: true } } }
+    });
+
+    ws.onopen = () => log.innerText += 'WS connected\n';
+    ws.onmessage = (evt) => {
+      const obj = JSON.parse(evt.data);
+      const t = obj.ts || new Date().toISOString();
+      const pred = obj.prediction;
+      const ready = obj.ready;
+      labels.push(t);
+      if (pred !== null && pred !== undefined) {
+        predData.push(pred);
+        // actual unknown here — we'll just mirror prediction to show value axis
+        actualData.push(null);
+      } else {
+        predData.push(null);
+        actualData.push(null);
+      }
+      if (labels.length > 100) { labels.shift(); predData.shift(); actualData.shift(); }
+      chart.update();
+      log.innerText = JSON.stringify(obj, null, 2) + '\n' + log.innerText;
+    };
+    ws.onclose = () => log.innerText += 'WS closed\n';
+  </script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+# Python / envs
+venv/
+.env
+.env.*
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual env folders
+env/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data / artifacts / outputs
+data/
+datasets/
+outputs/
+logs/
+checkpoints/
+models/
+*.h5
+*.hdf5
+*.pt
+*.ckpt
+
+# Streamlit
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Misc
+*.log
+*.tmp
+*.pickle
+*.pkl
+
+# PyCharm
+*.iml
