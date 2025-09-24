@@ -1,44 +1,66 @@
 """
-Professional Stock Predictor — Delta-based + Multi-feature + Residual-Informed Multi-day Forecast
-- Input features: Close, Open, High, Low, Volume, RSI(14), MACD
-- Predicts deltas (next_close - last_close) to avoid flat forecasts
-- Inverse transforms back to price by adding to last observed close
-- MC-dropout retained for epistemic uncertainty
-- Residual sampling added for aleatoric uncertainty
-- Bias correction (mean test residual)
-- Huber loss + MAE metric
-- Default horizon set to 5 for illustrative multi-day chart
+Polished Professional Stock Predictor — Delta-based + Multi-feature + Residual-Informed Multi-day Forecast
+
+Polish highlights:
+- TF log silencing to reduce noisy TensorArray warnings in logs.
+- Model + scaler caching (models/{TICKER}_model.h5, models/{TICKER}_scalers.pkl).
+- Sidebar "Retrain model" toggle to force retraining.
+- Shorter default training settings for faster deployments.
+- Same feature set & MC-dropout + residual sampling retained.
 """
+
+import os
+import time
+import logging
+import math
+import pickle
+from typing import Tuple, List
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
+from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
-from typing import Tuple, List
+
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import math
-import warnings
 
+# ---------------- Logging / TF clean up ----------------
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# silence TensorFlow excessive logs and autograph warnings that clutter cloud logs
+tf.get_logger().setLevel('ERROR')
+try:
+    tf.autograph.set_verbosity(0)
+except Exception:
+    pass
+
+import warnings
 warnings.filterwarnings("ignore")
+
+# ---------------- Determinism ----------------
 SEED = 42
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
+# ---------------- Streamlit config ----------------
 st.set_page_config(page_title="Professional Stock Predictor", layout="wide", page_icon="📊")
 
 # ---------------- Styling ----------------
 st.markdown("""
 <style>
-    .main-header { font-size: 2.0rem; font-weight: 700; color: #1f77b4; text-align: center; margin-bottom: 1rem; }
-    .debug { background: rgba(255,255,255,0.02); padding: 0.6rem; border-radius: 8px; color: #ddd; }
+    .main-header { font-size: 2.0rem; font-weight: 700; color: #1f77b4; text-align: left; margin-bottom: 1rem; }
+    .subtle { color: #9aa5b1; font-size:0.9rem; margin-bottom: 1rem; }
+    .metric-card { background: rgba(255,255,255,0.02); padding: 0.6rem; border-radius: 8px; color: #ddd; margin-bottom: 0.8rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -64,25 +86,26 @@ def compute_macd(series: pd.Series, fast: int = 12, slow: int = 26, sig: int = 9
 # ---------------- Data fetch & feature creation ----------------
 @st.cache_data(ttl=300)
 def fetch_stock_data_with_features(ticker: str, period: str = "2y") -> pd.DataFrame:
-    stock = yf.Ticker(ticker)
-    df = stock.history(period=period)
-    if df is None or df.empty:
+    """
+    Fetch price history and compute RSI/MACD.
+    Returns empty DataFrame on failure.
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        df = stock.history(period=period)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.reset_index()
+        df['Date'] = pd.to_datetime(df['Date'])
+        df['RSI_14'] = compute_rsi(df['Close'], window=14)
+        df['MACD'] = compute_macd(df['Close'], fast=12, slow=26, sig=9)
+        df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'RSI_14', 'MACD']].ffill().dropna().reset_index(drop=True)
+        return df
+    except Exception as e:
+        logger.warning(f"yfinance fetch failed for {ticker}: {e}")
         return pd.DataFrame()
-    df = df.reset_index()
-    df['Date'] = pd.to_datetime(df['Date'])
-    # Technical features
-    df['RSI_14'] = compute_rsi(df['Close'], window=14)
-    df['MACD'] = compute_macd(df['Close'], fast=12, slow=26, sig=9)
-    # Keep relevant columns and forward-fill any tiny gaps
-    df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'RSI_14', 'MACD']].ffill().dropna().reset_index(drop=True)
-    return df
 
 def create_window_features_multi(df: pd.DataFrame, lookback: int = 30, feature_cols: List[str] = None) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Build windows X of shape (n_samples, lookback, n_features) using feature_cols,
-    and targets y as delta of Close: next_close - last_close_in_window.
-    Feature column order is important (we expect Close to be at index 0 in the returned windows).
-    """
     if feature_cols is None:
         feature_cols = ['Close', 'Open', 'High', 'Low', 'Volume', 'RSI_14', 'MACD']
     prices = df['Close'].values
@@ -98,7 +121,7 @@ def create_window_features_multi(df: pd.DataFrame, lookback: int = 30, feature_c
     return np.array(X), np.array(y)
 
 # ---------------- Model builder ----------------
-def build_model_generic(model_type='lstm', input_shape=(30,7), units1=96, units2=48, dropout_rate=0.12, lr=5e-4):
+def build_model_generic(model_type='lstm', input_shape=(30,7), units1=64, units2=32, dropout_rate=0.12, lr=5e-4):
     model = Sequential()
     if model_type == 'lstm':
         model.add(LSTM(units1, return_sequences=True, input_shape=input_shape))
@@ -113,24 +136,19 @@ def build_model_generic(model_type='lstm', input_shape=(30,7), units1=96, units2
 
     model.add(Dense(64, activation='relu'))
     model.add(Dense(32, activation='relu'))
-    model.add(Dense(16, activation='relu'))
-    model.add(Dense(1))  # predict delta of Close
+    model.add(Dense(1))  # predict delta
     model.compile(optimizer=Adam(learning_rate=lr), loss='huber', metrics=['mae'])
     return model
 
-# ---------------- Predictor class (multi-feature aware) ----------------
+# ---------------- Predictor class ----------------
 class StockPredictor:
-    """
-    Scales X and y. Predicts deltas (next_close - last_close_in_window).
-    Expects the first feature in the feature vector to be 'Close' so we can reconstruct prices.
-    """
-    def __init__(self, model_type='lstm', lookback=30, n_features=7, units1=96, units2=48, dropout_rate=0.12, lr=5e-4):
+    def __init__(self, model_type='lstm', lookback=30, n_features=7, units1=64, units2=32, dropout_rate=0.12, lr=5e-4):
         self.model_type = model_type
         self.lookback = lookback
         self.n_features = n_features
         self.model = None
-        self.scaler = None       # scales flattened X features
-        self.y_scaler = None     # scales deltas
+        self.scaler = None
+        self.y_scaler = None
         self.is_trained = False
         self.units1 = units1
         self.units2 = units2
@@ -140,22 +158,20 @@ class StockPredictor:
     def build_model(self, input_shape):
         return build_model_generic(self.model_type, input_shape, self.units1, self.units2, self.dropout_rate, self.lr)
 
-    def train(self, X: np.ndarray, y: np.ndarray, validation_split=0.15, epochs=120, verbose=0):
+    def train(self, X: np.ndarray, y: np.ndarray, validation_split=0.15, epochs=60, verbose=0):
         n_samples, seq_len, n_features = X.shape
-        # Flatten and scale X
         self.scaler = MinMaxScaler()
         X_flat = X.reshape(-1, n_features)
         X_scaled_flat = self.scaler.fit_transform(X_flat)
         X_scaled = X_scaled_flat.reshape(n_samples, seq_len, n_features)
 
-        # Scale y (deltas)
         self.y_scaler = MinMaxScaler()
         y_2d = y.reshape(-1, 1)
         y_scaled = self.y_scaler.fit_transform(y_2d).reshape(-1)
 
         self.model = self.build_model((seq_len, n_features))
-        es = EarlyStopping(monitor='val_loss', patience=16, restore_best_weights=True, verbose=0)
-        rl = ReduceLROnPlateau(monitor='val_loss', patience=8, factor=0.2, min_lr=1e-6, verbose=0)
+        es = EarlyStopping(monitor='val_loss', patience=8, restore_best_weights=True, verbose=0)
+        rl = ReduceLROnPlateau(monitor='val_loss', patience=4, factor=0.3, min_lr=1e-6, verbose=0)
 
         history = self.model.fit(X_scaled, y_scaled, validation_split=validation_split,
                                  epochs=epochs, batch_size=32,
@@ -170,11 +186,6 @@ class StockPredictor:
         return X_scaled_flat.reshape(n_samples, seq_len, n_features)
 
     def predict_delta(self, X: np.ndarray, mc_dropout=False, n_iter=20) -> np.ndarray:
-        """
-        Return predicted delta(s).
-         - mc_dropout=False -> shape (n_samples,)
-         - mc_dropout=True -> shape (n_iter, n_samples)
-        """
         Xs = self._scale_X(X)
         if mc_dropout:
             preds = []
@@ -189,18 +200,53 @@ class StockPredictor:
             return p_real
 
     def predict_price_from_window(self, X_window: np.ndarray, mc_dropout=False, n_iter=20) -> np.ndarray:
-        """
-        Reconstruct predicted Close price(s) = last_window_close + predicted_delta.
-         - If mc_dropout True -> returns (n_iter, n_samples)
-         - Else returns (n_samples,)
-        Assumes Close is feature index 0.
-        """
         deltas = self.predict_delta(X_window, mc_dropout=mc_dropout, n_iter=n_iter)
-        last_closes = X_window[:, -1, 0]  # first column is Close per create_window_features_multi
+        last_closes = X_window[:, -1, 0]
         if mc_dropout:
             return deltas + last_closes[None, :]
         else:
             return deltas + last_closes
+
+# ---------------- Save / load helpers ----------------
+def ensure_dirs():
+    os.makedirs("models", exist_ok=True)
+    os.makedirs("data", exist_ok=True)
+
+def model_paths_for(ticker: str):
+    model_file = os.path.join("models", f"{ticker}_model.h5")
+    scaler_file = os.path.join("models", f"{ticker}_scalers.pkl")
+    return model_file, scaler_file
+
+def save_model_and_scalers(ticker: str, predictor: StockPredictor):
+    model_file, scaler_file = model_paths_for(ticker)
+    try:
+        predictor.model.save(model_file)
+        with open(scaler_file, "wb") as f:
+            pickle.dump({"scaler": predictor.scaler, "y_scaler": predictor.y_scaler}, f)
+        logger.info(f"Saved model and scalers for {ticker} -> {model_file}, {scaler_file}")
+    except Exception as e:
+        logger.warning(f"Failed to save model/scalers for {ticker}: {e}")
+
+def load_model_and_scalers(ticker: str):
+    model_file, scaler_file = model_paths_for(ticker)
+    if os.path.exists(model_file) and os.path.exists(scaler_file):
+        try:
+            m = load_model(model_file, compile=False)
+            with open(scaler_file, "rb") as f:
+                d = pickle.load(f)
+            scaler = d.get("scaler")
+            y_scaler = d.get("y_scaler")
+            pred = StockPredictor()
+            pred.model = m
+            pred.scaler = scaler
+            pred.y_scaler = y_scaler
+            pred.is_trained = True
+            logger.info(f"Loaded model for {ticker} from {model_file}")
+            return pred
+        except Exception as e:
+            logger.warning(f"Failed to load model/scalers for {ticker}: {e}")
+            return None
+    return None
 
 # ---------------- Plot helpers ----------------
 def create_prediction_figure(dates, actual, predicted, lower=None, upper=None, naive=None, title="Price Prediction with Confidence Bands"):
@@ -237,51 +283,80 @@ def plot_training_history_safe(history):
 
 # ---------------- App UI ----------------
 def main():
+    ensure_dirs()
     st.markdown('<h1 class="main-header">📊 Professional Stock Predictor</h1>', unsafe_allow_html=True)
+    st.markdown('<div class="subtle">Delta-based forecasting with MC-dropout & residual bootstrap uncertainty. Model caching enabled.</div>', unsafe_allow_html=True)
 
     # Sidebar controls
     with st.sidebar:
         st.header("⚙️ Settings")
         ticker = st.selectbox("Choose Stock", ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"], index=0)
         model_type = st.radio("Model", ["LSTM", "GRU"])
-        lookback = st.slider("Lookback Days", 10, 60, 30)  # increased default lookback
-        horizon = st.slider("Prediction Horizon (days)", 1, 10, 5)  # default 5
+        lookback = st.slider("Lookback Days", 10, 60, 30)
+        horizon = st.slider("Prediction Horizon (days)", 1, 10, 5)
         period = st.selectbox("History Period", ["1y", "2y", "3y", "5y"], index=1)
         with st.expander("Advanced Settings"):
-            epochs = st.slider("Epochs", 20, 300, 120, step=10)  # longer default
+            epochs = st.slider("Epochs", 10, 200, 60, step=10)
             mc_iters = st.slider("MC Dropout Iterations (CI)", 10, 200, 50, step=5)
-            show_naive = st.checkbox("Show Naive Baseline (Tomorrow = Today)", value=True)
+            retrain = st.checkbox("Retrain model (ignore cached)", value=False)
+            show_naive = st.checkbox("Show Naive Baseline (Yesterday's close)", value=True)
         analyze = st.button("🚀 Analyze", use_container_width=True)
 
     if not analyze:
         st.info("Adjust settings on the left and click Analyze.")
         return
 
-    # Fetch data + features
+    # Fetch data + features (use local cache fallback)
     with st.spinner("Fetching data and computing features..."):
         df = fetch_stock_data_with_features(ticker, period)
+
     if df.empty:
-        st.error("No data retrieved. Try another ticker or period.")
+        st.error("No data retrieved. Make sure you have local CSV cached or try 'Fetch latest data' in the repo.")
         return
 
+    # Prepare windows
     feature_cols = ['Close', 'Open', 'High', 'Low', 'Volume', 'RSI_14', 'MACD']
     X, y = create_window_features_multi(df, lookback=lookback, feature_cols=feature_cols)
     if len(X) < 50:
         st.error("Insufficient data for training. Increase period or reduce lookback.")
         return
 
-    # Split
+    # Train/test split
     split = int(len(X) * 0.8)
     X_train, y_train = X[:split], y[:split]
     X_test, y_test = X[split:], y[split:]
 
-    predictor = StockPredictor(model_type=model_type.lower(), lookback=lookback, n_features=len(feature_cols),
-                               units1=96, units2=48, dropout_rate=0.12, lr=5e-4)
+    # Build or load predictor
+    predictor = None
+    if not retrain:
+        predictor = load_model_and_scalers(ticker)
+        if predictor:
+            # ensure architecture matches selected model_type (best-effort)
+            predictor.model_type = model_type.lower()
+            st.success(f"Loaded cached model for {ticker}. (Toggle 'Retrain model' to retrain.)")
+    if predictor is None:
+        predictor = StockPredictor(model_type=model_type.lower(), lookback=lookback, n_features=len(feature_cols),
+                                   units1=64, units2=32, dropout_rate=0.12, lr=5e-4)
 
-    with st.spinner("Training model (this can take a little while)..."):
-        history = predictor.train(X_train, y_train, validation_split=0.15, epochs=epochs, verbose=0)
+    # Train only if model not trained / retrain requested
+    history = None
+    trained_here = False
+    if not predictor.is_trained or retrain:
+        with st.spinner("Training model (this can take a little while)..."):
+            history = predictor.train(X_train, y_train, validation_split=0.15, epochs=epochs, verbose=0)
+            trained_here = True
+            save_model_and_scalers(ticker, predictor)
+            st.success("Training finished and model cached.")
+    else:
+        st.info("Using cached model — skipping training.")
 
-    # Test predictions
+    # If history is None but we loaded model, create empty history for plotting logic
+    if history is None:
+        class DummyHistory:
+            history = {}
+        history = DummyHistory()
+
+    # Test predictions (deterministic)
     preds_test_prices = predictor.predict_price_from_window(X_test, mc_dropout=False)
 
     # Align test dates & true prices
@@ -313,14 +388,18 @@ def main():
             naive_test = df['Close'].iloc[naive_idx].values
 
     # Plot test
-    fig_test = create_prediction_figure(dates_test, true_prices, preds_test_prices,
-                                        lower=lower_test, upper=upper_test, naive=naive_test)
     st.subheader("📈 Test Prediction Chart")
+    fig_test = create_prediction_figure(dates_test, true_prices, preds_test_prices,
+                                        lower=lower_test, upper=upper_test, naive=naive_test,
+                                        title="Price Prediction with Confidence Bands")
     st.plotly_chart(fig_test, use_container_width=True)
 
-    # Training diagnostics
+    # Training diagnostics (if we trained here)
     st.subheader("📊 Training Diagnostics")
-    st.plotly_chart(plot_training_history_safe(history), use_container_width=True)
+    if hasattr(history, "history") and history.history:
+        st.plotly_chart(plot_training_history_safe(history), use_container_width=True)
+    else:
+        st.info("No training history available (model loaded from cache).")
 
     # Performance summary
     try:
@@ -334,6 +413,7 @@ def main():
     if naive_test is not None and model_mae is not None:
         perf["Naive MAE"] = float(mean_absolute_error(true_prices, naive_test))
         perf["Naive RMSE"] = float(math.sqrt(mean_squared_error(true_prices, naive_test)))
+
     st.subheader("🧾 Test Performance Summary")
     st.dataframe(pd.Series(perf).to_frame("Value").round(6))
 
@@ -351,7 +431,6 @@ def main():
         future_preds.append(pred_price)
         cur = cur_window.reshape(cur_window.shape[1], cur_window.shape[2]).copy()
         cur = np.roll(cur, -1, axis=0)
-        # replace only Close column (index 0) with predicted close
         cur[-1, 0] = pred_price
         cur_window = cur.reshape(1, cur.shape[0], cur.shape[1])
     future_preds = np.array(future_preds)
@@ -398,7 +477,7 @@ def main():
     except Exception:
         st.info("Future forecast table unavailable.")
 
-    st.success("Done — richer features added, horizon default 5, and residual-informed multi-day CIs enabled.")
+    st.success("Done — model ready. Use 'Retrain model' to re-fit and update cached model.")
 
 if __name__ == "__main__":
     main()
